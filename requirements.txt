@@ -1,8 +1,7 @@
 streamlit
 opencv-python-headless
-mediapipe
+mediapipe==0.10.14
 numpy
 gtts
 pydub
 protobuf==3.20.*
-
