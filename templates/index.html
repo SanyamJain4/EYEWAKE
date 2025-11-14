@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Eyewake – Live Drowsiness Detection</title>
+
+  <!-- Socket.IO -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+
+  <link rel="stylesheet" href="/static/css/style.css">
+
+  <style>
+    body {
+      background-color: #0d0d0d;
+      color: #ffffff;
+      text-align: center;
+      font-family: Arial, sans-serif;
+      padding: 20px;
+    }
+
+    h1 {
+      margin-bottom: 5px;
+      font-size: 36px;
+      font-weight: 700;
+      color: #18ffff;
+    }
+
+    #video-container {
+      margin-top: 20px;
+    }
+
+    #video-stream {
+      width: 70%;
+      border-radius: 12px;
+      border: 2px solid #18ffff;
+      box-shadow: 0 0 20px rgba(24,255,255,0.4);
+    }
+
+    .status-box {
+      margin: 20px auto;
+      padding: 15px;
+      width: 300px;
+      background: #111;
+      border-radius: 8px;
+      box-shadow: 0 0 12px rgba(24,255,255,0.3);
+    }
+
+    .status-label {
+      font-size: 22px;
+      font-weight: bold;
+      color: #18ffff;
+    }
+
+    .status-value {
+      font-size: 26px;
+      margin-top: 5px;
+    }
+
+    .btn {
+      padding: 10px 20px;
+      margin: 10px;
+      font-size: 16px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: 0.2s;
+    }
+
+    .btn-calibrate {
+      background: #2196f3;
+      color: white;
+    }
+    .btn-calibrate:hover { background: #42a5f5; }
+
+    .btn-stop {
+      background: #e91e63;
+      color: white;
+    }
+    .btn-stop:hover { background: #f06292; }
+
+  </style>
+</head>
+
+<body>
+
+  <h1>🕶️ Eyewake – Live Drowsiness Monitor</h1>
+
+  <!-- STATUS BOX -->
+  <div class="status-box">
+    <div class="status-label">STATUS</div>
+    <div class="status-value" id="statusText">Waiting...</div>
+  </div>
+
+  <!-- LIVE VIDEO STREAM -->
+  <div id="video-container">
+    <img id="video-stream" src="{{ url_for('video_feed') }}" alt="Camera Stream">
+  </div>
+
+  <!-- BUTTONS -->
+  <div style="margin-top: 25px;">
+    <button class="btn btn-calibrate" onclick="sendCalibrate()">Calibrate</button>
+    <button class="btn btn-stop" onclick="sendStop()">Stop</button>
+  </div>
+
+  <!-- FOOTER -->
+  <p style="margin-top: 30px; opacity: 0.5;">Eyewake – Real-time driver alertness detection</p>
+
+  <!-- JS -->
+  <script src="/static/js/main.js"></script>
+
+  <script>
+    const socket = io();
+
+    socket.on("connect", () => {
+      console.log("Connected to backend");
+    });
+
+    socket.on("status", (data) => {
+      document.getElementById("statusText").innerText = data.status;
+    });
+
+    socket.on("calibration_started", () => {
+      document.getElementById("statusText").innerText = "Calibrating...";
+    });
+
+    socket.on("calibrated", () => {
+      document.getElementById("statusText").innerText = "Calibration Complete";
+    });
+
+    socket.on("stopped", () => {
+      document.getElementById("statusText").innerText = "Stopped";
+    });
+
+    function sendCalibrate() {
+      socket.emit("calibrate", {});
+    }
+
+    function sendStop() {
+      socket.emit("stop", {});
+    }
+  </script>
+
+</body>
+</html>
