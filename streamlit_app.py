@@ -1,402 +1,248 @@
-# streamlit_app.py
-"""
-EYEWAKE — Camera-only Streamlit app (no cv2)
-- Uses st.camera_input() for browser camera
-- Uses MediaPipe FaceMesh for landmarks
-- Pixel-based eye + yawn detection, calibration, TTS queue (pyttsx3 -> gTTS)
-- Uses PIL for overlays (no cv2 import)
-"""
+# ============================================================
+#  EYEWAKE — Streamlit FINAL VERSION
+#  Pixel-based eye + yawn detection
+#  With mediapipe import safety (for Streamlit Cloud)
+# ============================================================
 
 import streamlit as st
 import time
+import threading
 import queue
 import uuid
-import os
 import tempfile
-import traceback
-from collections import deque
-from io import BytesIO
-
-# imaging
-from PIL import Image, ImageDraw, ImageFont
+import cv2
 import numpy as np
 
-# mediapipe (required)
+# ------------------------------------------------------------
+# TRY IMPORT MEDIAPIPE SAFELY
+# ------------------------------------------------------------
+
+MEDIAPIPE_AVAILABLE = True
 try:
     import mediapipe as mp
 except Exception as e:
-    mp = None
-    MP_IMPORT_ERROR = traceback.format_exc()
+    MEDIAPIPE_AVAILABLE = False
+    MP_ERROR = str(e)
 
-# Optional offline TTS
+# ------------------------------------------------------------
+# AUDIO MODULES
+# ------------------------------------------------------------
 try:
     import pyttsx3
     PYTTSX3_AVAILABLE = True
-except Exception:
+except:
     PYTTSX3_AVAILABLE = False
 
-# gTTS fallback
 try:
     from gtts import gTTS
     GTTS_AVAILABLE = True
-except Exception:
+except:
     GTTS_AVAILABLE = False
 
-# ----------------------------
-# CONSTANTS (same as your original)
-CONSEC_FRAMES_RED = 25
-ALERT_INTERVAL = 5.0
-CALIBRATION_TIME = 5.0
-
-YAWN_PHYS_PIXELS = 20
-YAWN_MIN_DURATION = 4.0
-YAWN_COOLDOWN = 2.0
-
-EYE_HISTORY_LEN = 15
-DEFAULT_EYE_THRESH = 12.0    # px before calibration
-
-# Mediapipe landmark indices (same)
-L_EYE_T, L_EYE_B = 159, 145
-R_EYE_T, R_EYE_B = 386, 374
-MOUTH_TOP, MOUTH_BOTTOM = 13, 14
-
-# ----------------------------
-# Shared app state via session_state
-if "eyewake_state" not in st.session_state:
-    st.session_state.eyewake_state = {
-        "status": "INIT",
-        "yawns": 0,
-        "alerts": 0,
-        "eye_avg": 0.0,
-        "mouth_avg": 0.0,
-        "baseline": None,
-        "eye_thresh": None,
-        "calibrating": False,
-        "calib_elapsed": 0.0,
-        "eye_history": deque(maxlen=EYE_HISTORY_LEN),
-        "mouth_history": deque(maxlen=EYE_HISTORY_LEN),
-        # local runtime flags (not persisted)
-        "_yawning": False,
-        "_yawn_start": 0.0,
-        "_last_yawn_time": 0.0,
-        "_closed_frames": 0,
-        "_last_alert": 0.0,
-        "_calib_start": None,
-        "_calib_samples": [],
-    }
-
-state = st.session_state.eyewake_state
-
-# audio queue for main thread to play
 audio_queue = queue.Queue()
 
-def synthesize_audio_bytes(text):
-    """Try pyttsx3 → gTTS → return audio bytes and mime or (None, None)."""
+def make_audio(text):
+    """Synthesize audio fallback system."""
     uid = uuid.uuid4().hex
-
-    # 1. pyttsx3 offline
+    # pyttsx3
     if PYTTSX3_AVAILABLE:
         try:
             engine = pyttsx3.init()
             engine.setProperty("rate", 150)
-            out_file = os.path.join(tempfile.gettempdir(), f"tts_{uid}.wav")
+            out_file = tempfile.gettempdir() + f"/tts_{uid}.wav"
             engine.save_to_file(text, out_file)
             engine.runAndWait()
-            with open(out_file, "rb") as f:
-                data = f.read()
-            os.remove(out_file)
+            data = open(out_file, "rb").read()
             return data, "audio/wav"
-        except Exception:
+        except:
             pass
 
-    # 2. gTTS fallback
+    # gTTS fallback
     if GTTS_AVAILABLE:
         try:
-            out_file = os.path.join(tempfile.gettempdir(), f"tts_{uid}.mp3")
-            gTTS(text=text, lang="en").save(out_file)
-            with open(out_file, "rb") as f:
-                data = f.read()
-            os.remove(out_file)
+            out_file = tempfile.gettempdir() + f"/tts_{uid}.mp3"
+            gTTS(text).save(out_file)
+            data = open(out_file, "rb").read()
             return data, "audio/mp3"
-        except Exception:
+        except:
             pass
 
     return None, None
 
+
 def queue_audio(text):
     audio_queue.put(text)
 
-# ----------------------------
-# Helpers: mediapipe landmark extraction and drawing (PIL)
-def lm_to_pixel(lm, idx, w, h):
-    p = lm[idx]
-    return int(p.x * w), int(p.y * h)
 
-def draw_overlay_pil(image_pil, landmarks, w, h, state_snapshot):
-    """Draw small markers and text overlay on PIL image and return PIL image."""
-    draw = ImageDraw.Draw(image_pil)
-    # try to load a default font
-    try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 16)
-    except Exception:
-        font = ImageFont.load_default()
+# ------------------------------------------------------------
+# GLOBAL STATE
+# ------------------------------------------------------------
+running_event = threading.Event()
+stop_event = threading.Event()
+frame_lock = threading.Lock()
 
-    # draw landmarks markers
-    if landmarks:
-        lm = landmarks
-        for idx in (L_EYE_T, L_EYE_B, R_EYE_T, R_EYE_B, MOUTH_TOP, MOUTH_BOTTOM):
-            x, y = lm_to_pixel(lm, idx, w, h)
-            r = 3
-            draw.ellipse((x-r, y-r, x+r, y+r), fill=(0,255,0))
+latest_overlay = None
+state = {
+    "status": "NOT RUNNING",
+    "yawns": 0,
+    "alerts": 0,
+    "eye_avg": 0.0,
+    "mouth_avg": 0.0,
+}
 
-    # status text
-    text_lines = [
-        f"Status: {state_snapshot.get('status','-')}",
-        f"Eye(px): {state_snapshot.get('eye_avg',0.0):.1f}  Thresh(px): {state_snapshot.get('eye_thresh') or DEFAULT_EYE_THRESH:.1f}",
-        f"Mouth(px): {state_snapshot.get('mouth_avg',0.0):.1f}",
-        f"Yawns: {state_snapshot.get('yawns',0)}  Alerts: {state_snapshot.get('alerts',0)}"
-    ]
-    y0 = 6
-    for line in text_lines:
-        draw.text((6, y0), line, fill=(255,255,0), font=font)
-        y0 += 18
 
-    return image_pil
+# ------------------------------------------------------------
+# DETECTION LOOP
+# ------------------------------------------------------------
+def detection_loop(index):
 
-# ----------------------------
-# UI
-st.set_page_config(page_title="Eyewake (camera-only)", layout="centered")
-st.title("🕶️ EYEWAKE — Camera-only (no cv2)")
+    global latest_overlay
+    mp_face = mp.solutions.face_mesh
 
-# Mediapipe availability check
-if mp is None:
-    st.error("MediaPipe failed to import. The app requires `mediapipe` installed.")
-    with st.expander("MediaPipe import traceback"):
-        st.code(MP_IMPORT_ERROR)
-    st.stop()
+    cap = cv2.VideoCapture(index)
+    if not cap.isOpened():
+        state["status"] = "CAMERA ERROR"
+        queue_audio("Camera not detected")
+        running_event.clear()
+        return
 
-mp_face = mp.solutions.face_mesh
-
-with st.sidebar:
-    st.header("Controls")
-    st.write("Use your browser camera to take a snapshot and analyze.")
-    # simple option to auto-calibrate on next N captures, but we keep the button for manual calibrate
-    cam_note = st.info("Camera works only inside the browser. Allow camera permission when prompted.")
-
-col1, col2, col3 = st.columns(3)
-
-start_btn = col1.button("Take Snapshot")
-calib_btn = col2.button("Calibrate (from this shot)")
-reset_btn = col3.button("Reset Stats")
-
-# Display slots
-img_slot = st.empty()
-status_slot = st.empty()
-meta_slot = st.empty()
-
-# Reset logic
-if reset_btn:
-    # reset persistent values
-    state.update({
-        "status": "INIT",
-        "yawns": 0,
-        "alerts": 0,
-        "eye_avg": 0.0,
-        "mouth_avg": 0.0,
-        "baseline": None,
-        "eye_thresh": None,
-        "calibrating": False,
-        "calib_elapsed": 0.0,
-        "eye_history": deque(maxlen=EYE_HISTORY_LEN),
-        "mouth_history": deque(maxlen=EYE_HISTORY_LEN),
-        "_yawning": False,
-        "_yawn_start": 0.0,
-        "_last_yawn_time": 0.0,
-        "_closed_frames": 0,
-        "_last_alert": 0.0,
-        "_calib_start": None,
-        "_calib_samples": [],
-    })
-    st.success("Stats reset")
-
-# Camera input (single snapshot)
-img_file = st.camera_input("Click to take a picture", key="camera_input")
-
-def process_frame_pil(pil_image):
-    """
-    Input: PIL image in RGB mode.
-    Returns: annotated PIL image, a state snapshot dict update
-    """
-    w, h = pil_image.size
-    # convert to numpy RGB
-    rgb = np.array(pil_image)
-    # process via mediapipe (expects RGB uint8)
-    face_mesh = mp_face.FaceMesh(static_image_mode=True, max_num_faces=1,
-                                 refine_landmarks=True,
-                                 min_detection_confidence=0.5)
-    results = face_mesh.process(rgb)
-    face_mesh.close()
-
-    eye_pixels = 0.0
-    mouth_pixels = 0.0
-    landmarks = None
-
-    if results.multi_face_landmarks:
-        landmarks = results.multi_face_landmarks[0].landmark
-
-        # compute eye pixel heights
-        lt = lm_to_pixel(landmarks, L_EYE_T, w, h)
-        lb = lm_to_pixel(landmarks, L_EYE_B, w, h)
-        rt = lm_to_pixel(landmarks, R_EYE_T, w, h)
-        rb = lm_to_pixel(landmarks, R_EYE_B, w, h)
-
-        left_h = abs(lt[1] - lb[1])
-        right_h = abs(rt[1] - rb[1])
-        eye_pixels = (left_h + right_h) / 2.0
-
-        # mouth gap
-        mt = lm_to_pixel(landmarks, MOUTH_TOP, w, h)
-        mb = lm_to_pixel(landmarks, MOUTH_BOTTOM, w, h)
-        mouth_pixels = abs(mb[1] - mt[1])
-
-    # smoothing
-    eh = state["eye_history"]
-    mh = state["mouth_history"]
-    eh.append(eye_pixels)
-    mh.append(mouth_pixels)
-
-    eye_avg = float(np.mean(eh)) if len(eh) else 0.0
-    mouth_avg = float(np.mean(mh)) if len(mh) else 0.0
-
-    # ---------------- calibration (manual trigger)
-    if state.get("calibrating", False):
-        if state["_calib_start"] is None:
-            state["_calib_start"] = time.time()
-            state["_calib_samples"] = []
-            queue_audio("Calibration started")
-        else:
-            state["calib_elapsed"] = time.time() - state["_calib_start"]
-
-        state["_calib_samples"].append(eye_pixels)
-
-        if time.time() - state["_calib_start"] >= CALIBRATION_TIME:
-            baseline = float(np.median(state["_calib_samples"])) if state["_calib_samples"] else 12.0
-            thresh = baseline * 0.6
-            state["baseline"] = baseline
-            state["eye_thresh"] = thresh
-            state["calibrating"] = False
-            state["calib_elapsed"] = 0.0
-            state["_calib_start"] = None
-            state["_calib_samples"] = []
-            queue_audio("Calibration complete")
-
-    # ---------------- yawn detection
-    if mouth_avg > YAWN_PHYS_PIXELS:
-        if not state["_yawning"]:
-            state["_yawning"] = True
-            state["_yawn_start"] = time.time()
-        else:
-            if time.time() - state["_yawn_start"] >= YAWN_MIN_DURATION:
-                if time.time() - state["_last_yawn_time"] >= YAWN_COOLDOWN:
-                    state["yawns"] += 1
-                    state["_last_yawn_time"] = time.time()
-                    state["_yawning"] = False
-                    queue_audio("Yawn detected")
-    else:
-        state["_yawning"] = False
-
-    # ---------------- eye closure detection
-    thresh = state.get("eye_thresh") or DEFAULT_EYE_THRESH
-    if eye_avg < thresh:
-        state["_closed_frames"] += 1
-    else:
-        state["_closed_frames"] = 0
-
-    now = time.time()
-    if state["_closed_frames"] >= CONSEC_FRAMES_RED:
-        if now - state["_last_alert"] >= ALERT_INTERVAL:
-            state["alerts"] += 1
-            state["status"] = "DROWSY"
-            state["_last_alert"] = now
-            queue_audio("You look drowsy. Please take a break.")
-    else:
-        if state.get("calibrating"):
-            state["status"] = "CALIBRATING"
-        elif mouth_avg > YAWN_PHYS_PIXELS:
-            state["status"] = "YAWNING"
-        else:
-            state["status"] = "ACTIVE"
-
-    # update numeric stats
-    state["eye_avg"] = eye_avg
-    state["mouth_avg"] = mouth_avg
-
-    # draw overlay (PIL)
-    annotated = pil_image.copy()
-    annotated = draw_overlay_pil(annotated, landmarks, w, h, state)
-
-    return annotated
-
-# buttons behavior
-if start_btn:
-    if img_file is None:
-        st.warning("No image captured — click the camera widget first.")
-    else:
-        try:
-            # read image into PIL
-            bytes_data = img_file.getvalue()
-            pil = Image.open(BytesIO(bytes_data)).convert("RGB")
-            annotated = process_frame_pil(pil)
-            img_slot.image(annotated, use_column_width=True)
-        except Exception as e:
-            st.error(f"Processing error: {e}")
-            traceback.print_exc()
-
-if calib_btn:
-    # start manual calibration — will use subsequent snapshots to collect samples
-    state["calibrating"] = True
-    state["calib_elapsed"] = 0.0
-    state["_calib_start"] = None
-    state["_calib_samples"] = []
-    st.info("Calibration started — take snapshots for the next few seconds.")
-
-# auto-display last analysis if exists (nice UX)
-if img_file and not start_btn:
-    # show the captured image (no overlay) so user sees what they snapped
-    img_slot.image(img_file, use_column_width=True)
-
-# ----------------------------
-# audio playback loop (main thread)
-while not audio_queue.empty():
-    msg = audio_queue.get()
-    audio_bytes, mime = synthesize_audio_bytes(msg)
-    if audio_bytes:
-        st.audio(audio_bytes, format=mime)
-    audio_queue.task_done()
-
-# status + meta display
-s_snapshot = dict(state)
-status_slot.markdown(
-    f"**Status:** {s_snapshot.get('status','-')} • "
-    f"**Yawns:** {s_snapshot.get('yawns',0)} • "
-    f"**Alerts:** {s_snapshot.get('alerts',0)}"
-)
-
-eye_val = s_snapshot.get("eye_avg") or 0.0
-mouth_val = s_snapshot.get("mouth_avg") or 0.0
-baseline = s_snapshot.get("baseline") or 0.0
-thr = s_snapshot.get("eye_thresh") or DEFAULT_EYE_THRESH
-
-if s_snapshot.get("calibrating"):
-    meta_slot.info(f"Calibrating… {s_snapshot.get('calib_elapsed',0):.1f}/{CALIBRATION_TIME}s")
-else:
-    meta_slot.write(
-        f"Eye(px): {eye_val:.1f} | "
-        f"Mouth(px): {mouth_val:.1f} | "
-        f"Baseline: {baseline:.1f} | "
-        f"Threshold(px): {thr:.1f}"
+    face_mesh = mp_face.FaceMesh(
+        max_num_faces=1,
+        refine_landmarks=True
     )
 
-# helpful footer
-st.caption("Tip: click 'Take Snapshot' to analyze the frame. Use 'Calibrate' then take snapshots for accurate eye thresholding.")
+    while running_event.is_set() and not stop_event.is_set():
 
+        ok, frame = cap.read()
+        if not ok:
+            continue
+
+        frame = cv2.flip(frame, 1)
+        h, w = frame.shape[:2]
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = face_mesh.process(rgb)
+
+        eye_height = 0
+        mouth_gap = 0
+
+        if result.multi_face_landmarks:
+            lm = result.multi_face_landmarks[0].landmark
+
+            # Eye + mouth points
+            def p(i):
+                return int(lm[i].x * w), int(lm[i].y * h)
+
+            lt = p(159)
+            lb = p(145)
+            rt = p(386)
+            rb = p(374)
+
+            eye_height = (abs(lt[1]-lb[1]) + abs(rt[1]-rb[1])) / 2
+
+            mt = p(13)
+            mb = p(14)
+            mouth_gap = abs(mb[1] - mt[1])
+
+            # draw
+            for i in [159,145,386,374,13,14]:
+                cv2.circle(frame, p(i), 2, (0,255,0), -1)
+
+        state["eye_avg"] = eye_height
+        state["mouth_avg"] = mouth_gap
+
+        if eye_height < 10:
+            state["alerts"] += 1
+            queue_audio("Eyes closing detected")
+
+        if mouth_gap > 25:
+            state["yawns"] += 1
+            queue_audio("Yawn detected")
+
+        state["status"] = "RUNNING"
+
+        overlay = frame.copy()
+        cv2.putText(overlay, f"Eye(px): {eye_height:.1f}", (10,25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+
+        with frame_lock:
+            latest_overlay = overlay.copy()
+
+        time.sleep(0.02)
+
+    cap.release()
+    state["status"] = "STOPPED"
+
+
+# ============================================================
+# UI SECTION
+# ============================================================
+
+st.set_page_config(page_title="Eyewake", layout="centered")
+st.title("🕶️ Eyewake — Drowsiness Detector")
+
+# ------------------ CHECK MEDIAPIPE FIRST -------------------
+if not MEDIAPIPE_AVAILABLE:
+    st.error("❌ MediaPipe failed to import. This app requires MediaPipe!")
+    st.code(MP_ERROR)
+    st.info("Fix: Ensure Python = 3.11 and mediapipe==0.10.14 in requirements.txt")
+    st.stop()
+
+# ------------------------------------------------------------
+# Sidebar
+# ------------------------------------------------------------
+cam_idx = st.sidebar.number_input("Camera Index", 0, 5, 0)
+
+col1, col2 = st.columns(2)
+
+with col1:
+    if st.button("Start Detection") and not running_event.is_set():
+        running_event.set()
+        stop_event.clear()
+        threading.Thread(target=detection_loop, args=(cam_idx,), daemon=True).start()
+        queue_audio("Detection started")
+
+with col2:
+    if st.button("Stop"):
+        running_event.clear()
+        stop_event.set()
+        queue_audio("Stopping")
+
+
+img_slot = st.empty()
+info_slot = st.empty()
+
+# ------------------------------------------------------------
+# MAIN LOOP
+# ------------------------------------------------------------
+
+while True:
+
+    # Audio
+    while not audio_queue.empty():
+        msg = audio_queue.get()
+        data, fmt = make_audio(msg)
+        if data:
+            st.audio(data, format=fmt)
+        audio_queue.task_done()
+
+    # Video
+    if running_event.is_set():
+        with frame_lock:
+            frame = None if latest_overlay is None else latest_overlay.copy()
+
+        if frame is not None:
+            img_slot.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+        s = state.copy()
+        info_slot.info(
+            f"Status: {s['status']} | Eye(px): {s['eye_avg']:.1f} | "
+            f"Mouth(px): {s['mouth_avg']:.1f} | "
+            f"Yawns: {s['yawns']} | Alerts: {s['alerts']}"
+        )
+    else:
+        img_slot.image(np.zeros((480,640,3), dtype=np.uint8))
+        info_slot.info("Status: Not running")
+        break
+
+    time.sleep(0.12)
