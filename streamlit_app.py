@@ -1,81 +1,35 @@
-# ============================================================
-#  EYEWAKE — Streamlit FINAL VERSION
-#  Pixel-based eye + yawn detection
-#  Hybrid audio (pyttsx3 → gTTS → audio in browser)
-#  NO storage, NO profile file
-#  Fully crash-proof (all None safe)
-# ============================================================
-
+# streamlit_app.py
+# Eyewake — streamlit-webrtc version (browser camera -> server-side MediaPipe)
 import streamlit as st
-import threading
 import time
-from collections import deque
 import queue
-import tempfile
 import uuid
-import traceback
 import os
+import tempfile
+import traceback
 
 import cv2
 import numpy as np
 import mediapipe as mp
 
-# ------------------------------------------------------------
-# AUDIO SYSTEM (pyttsx3 → gTTS fallback → browser audio)
-# ------------------------------------------------------------
+# webrtc
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
+
+# Optional audio engines
 try:
     import pyttsx3
     PYTTSX3_AVAILABLE = True
-except:
+except Exception:
     PYTTSX3_AVAILABLE = False
 
 try:
     from gtts import gTTS
     GTTS_AVAILABLE = True
-except:
+except Exception:
     GTTS_AVAILABLE = False
 
-audio_queue = queue.Queue()
-
-def synthesize_audio_bytes(text):
-    """Try pyttsx3 → gTTS → return audio bytes."""
-    uid = uuid.uuid4().hex
-
-    # --- 1. pyttsx3 offline ---
-    if PYTTSX3_AVAILABLE:
-        try:
-            engine = pyttsx3.init()
-            engine.setProperty("rate", 150)
-            out_file = os.path.join(tempfile.gettempdir(), f"tts_{uid}.wav")
-            engine.save_to_file(text, out_file)
-            engine.runAndWait()
-            data = open(out_file, "rb").read()
-            os.remove(out_file)
-            return data, "audio/wav"
-        except:
-            pass
-
-    # --- 2. gTTS fallback ---
-    if GTTS_AVAILABLE:
-        try:
-            out_file = os.path.join(tempfile.gettempdir(), f"tts_{uid}.mp3")
-            gTTS(text=text, lang="en").save(out_file)
-            data = open(out_file, "rb").read()
-            os.remove(out_file)
-            return data, "audio/mp3"
-        except:
-            pass
-
-    return None, None
-
-
-def queue_audio(text):
-    audio_queue.put(text)
-
-
-# ------------------------------------------------------------
-# CONSTANTS (Pixel-based detection)
-# ------------------------------------------------------------
+# -------------------------
+# Constants (copied from your original)
 CONSEC_FRAMES_RED = 25
 ALERT_INTERVAL = 5.0
 CALIBRATION_TIME = 5.0
@@ -92,20 +46,8 @@ L_EYE_T, L_EYE_B = 159, 145
 R_EYE_T, R_EYE_B = 386, 374
 MOUTH_TOP, MOUTH_BOTTOM = 13, 14
 
-
-# ------------------------------------------------------------
-# STATE
-# ------------------------------------------------------------
-frame_lock = threading.Lock()
-latest_overlay = None
-
-running_event = threading.Event()
-stop_event = threading.Event()
-calibrate_event = threading.Event()
-
-eye_history = deque(maxlen=EYE_HISTORY_LEN)
-mouth_history = deque(maxlen=EYE_HISTORY_LEN)
-
+# -------------------------
+# Shared state (thread-safe-ish since transformer and main thread run separately)
 state = {
     "status": "INIT",
     "yawns": 0,
@@ -118,75 +60,92 @@ state = {
     "calib_elapsed": 0.0,
 }
 
+# audio queue (main thread will play)
+audio_queue = queue.Queue()
 
-# ------------------------------------------------------------
-# Mediapipe Helper
-# ------------------------------------------------------------
-mp_face = mp.solutions.face_mesh
+def synthesize_audio_bytes(text):
+    """Try pyttsx3 → gTTS fallback → return (bytes, mime) or (None, None)."""
+    uid = uuid.uuid4().hex
 
+    # pyttsx3 offline
+    if PYTTSX3_AVAILABLE:
+        try:
+            engine = pyttsx3.init()
+            engine.setProperty("rate", 150)
+            out_file = os.path.join(tempfile.gettempdir(), f"tts_{uid}.wav")
+            engine.save_to_file(text, out_file)
+            engine.runAndWait()
+            with open(out_file, "rb") as f:
+                data = f.read()
+            os.remove(out_file)
+            return data, "audio/wav"
+        except Exception:
+            pass
+
+    # gTTS fallback
+    if GTTS_AVAILABLE:
+        try:
+            out_file = os.path.join(tempfile.gettempdir(), f"tts_{uid}.mp3")
+            gTTS(text=text, lang="en").save(out_file)
+            with open(out_file, "rb") as f:
+                data = f.read()
+            os.remove(out_file)
+            return data, "audio/mp3"
+        except Exception:
+            pass
+
+    return None, None
+
+def queue_audio(text):
+    audio_queue.put(text)
+
+# -------------------------
+# Helper to convert normalized landmarks to pixels
 def extract_point(lm, idx, w, h):
     p = lm[idx]
     return (int(p.x * w), int(p.y * h))
 
+# -------------------------
+# Video transformer: runs in worker thread created by streamlit-webrtc
+class MediaPipeTransformer(VideoTransformerBase):
+    def __init__(self):
+        self.mp_face = mp.solutions.face_mesh
+        self.face_mesh = self.mp_face.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        self.eye_history = []
+        self.mouth_history = []
+        self.closed_frames = 0
 
-# ============================================================
-# DETECTION LOOP — THREAD
-# ============================================================
-def detection_loop(cam_index=0):
+        self.yawning = False
+        self.yawn_start = 0
+        self.last_yawn_time = 0
+        self.last_alert = 0
 
-    global latest_overlay
+        self.calib_start = None
+        self.calib_samples = []
 
-    cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    def transform(self, frame):
+        """
+        frame: av.VideoFrame wrapper from streamlit-webrtc
+        Should return a numpy ndarray (BGR) to be shown in the browser.
+        """
+        img = frame.to_ndarray(format="bgr24")
+        h, w = img.shape[:2]
 
-    ret, test = cap.read()
-    if not ret:
-        state["status"] = "CAMERA ERROR"
-        queue_audio("Camera not detected")
-        running_event.clear()
-        return
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        res = self.face_mesh.process(rgb)
 
-    face_mesh = mp_face.FaceMesh(
-        static_image_mode=False,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5
-    )
-
-    closed_frames = 0
-    yawning = False
-    yawn_start = 0
-    last_yawn_time = 0
-    last_alert = 0
-
-    calib_start = None
-    calib_samples = []
-
-    running_event.set()
-    stop_event.clear()
-
-    while running_event.is_set() and not stop_event.is_set():
-
-        ret, frame = cap.read()
-        if not ret:
-            continue
-
-        frame = cv2.flip(frame, 1)
-        h, w = frame.shape[:2]
-
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        res = face_mesh.process(rgb)
-
-        # default values (avoid None)
         eye_pixels = 0.0
         mouth_pixels = 0.0
 
         if res.multi_face_landmarks:
             lm = res.multi_face_landmarks[0].landmark
 
-            # Pixel eye height
             lt = extract_point(lm, L_EYE_T, w, h)
             lb = extract_point(lm, L_EYE_B, w, h)
             rt = extract_point(lm, R_EYE_T, w, h)
@@ -196,37 +155,40 @@ def detection_loop(cam_index=0):
             right_h = abs(rt[1] - rb[1])
             eye_pixels = (left_h + right_h) / 2.0
 
-            # Pixel mouth gap
             mt = extract_point(lm, MOUTH_TOP, w, h)
             mb = extract_point(lm, MOUTH_BOTTOM, w, h)
             mouth_pixels = abs(mb[1] - mt[1])
 
-            # markers
+            # draw markers
             for idx in (L_EYE_T, L_EYE_B, R_EYE_T, R_EYE_B, MOUTH_TOP, MOUTH_BOTTOM):
                 p = extract_point(lm, idx, w, h)
-                cv2.circle(frame, p, 2, (0,255,0), -1)
+                cv2.circle(img, p, 2, (0,255,0), -1)
 
-        # smoothing
-        eye_history.append(eye_pixels)
-        mouth_history.append(mouth_pixels)
+        # smoothing (circular buffer like)
+        self.eye_history.append(eye_pixels)
+        if len(self.eye_history) > EYE_HISTORY_LEN:
+            self.eye_history.pop(0)
 
-        eye_avg = float(np.mean(eye_history)) if eye_history else 0.0
-        mouth_avg = float(np.mean(mouth_history)) if mouth_history else 0.0
+        self.mouth_history.append(mouth_pixels)
+        if len(self.mouth_history) > EYE_HISTORY_LEN:
+            self.mouth_history.pop(0)
 
-        # ---------------- CALIBRATION ----------------
-        if calibrate_event.is_set():
-            if calib_start is None:
-                calib_start = time.time()
-                calib_samples = []
-                state["calibrating"] = True
+        eye_avg = float(np.mean(self.eye_history)) if self.eye_history else 0.0
+        mouth_avg = float(np.mean(self.mouth_history)) if self.mouth_history else 0.0
+
+        # calibration (the main thread sets state["calibrating"]=True when user presses Calibrate)
+        if state.get("calibrating", False):
+            if self.calib_start is None:
+                self.calib_start = time.time()
+                self.calib_samples = []
                 queue_audio("Calibration started")
             else:
-                state["calib_elapsed"] = time.time() - calib_start
+                state["calib_elapsed"] = time.time() - self.calib_start
 
-            calib_samples.append(eye_pixels)
+            self.calib_samples.append(eye_pixels)
 
-            if time.time() - calib_start >= CALIBRATION_TIME:
-                baseline = float(np.median(calib_samples)) if calib_samples else 12.0
+            if time.time() - self.calib_start >= CALIBRATION_TIME:
+                baseline = float(np.median(self.calib_samples)) if self.calib_samples else 12.0
                 thresh = baseline * 0.6
 
                 state["baseline"] = baseline
@@ -234,134 +196,133 @@ def detection_loop(cam_index=0):
                 state["calibrating"] = False
                 state["calib_elapsed"] = 0.0
 
-                calibrate_event.clear()
-                calib_start = None
+                self.calib_start = None
+                self.calib_samples = []
                 queue_audio("Calibration complete")
 
-        # ---------------- YAWN DETECTION ----------------
+        # yawn detection
         if mouth_avg > YAWN_PHYS_PIXELS:
-            if not yawning:
-                yawning = True
-                yawn_start = time.time()
+            if not self.yawning:
+                self.yawning = True
+                self.yawn_start = time.time()
             else:
-                if time.time() - yawn_start >= YAWN_MIN_DURATION:
-                    if time.time() - last_yawn_time >= YAWN_COOLDOWN:
+                if time.time() - self.yawn_start >= YAWN_MIN_DURATION:
+                    if time.time() - self.last_yawn_time >= YAWN_COOLDOWN:
                         state["yawns"] += 1
-                        last_yawn_time = time.time()
-                        yawning = False
+                        self.last_yawn_time = time.time()
+                        self.yawning = False
                         queue_audio("Yawn detected")
         else:
-            yawning = False
+            self.yawning = False
 
-        # ---------------- EYE CLOSURE DETECTION ----------------
+        # eye closure detection
         thresh = state.get("eye_thresh") or DEFAULT_EYE_THRESH
 
         if eye_avg < thresh:
-            closed_frames += 1
+            self.closed_frames += 1
         else:
-            closed_frames = 0
+            self.closed_frames = 0
 
         now = time.time()
 
-        if closed_frames >= CONSEC_FRAMES_RED:
-            if now - last_alert >= ALERT_INTERVAL:
+        if self.closed_frames >= CONSEC_FRAMES_RED:
+            if now - self.last_alert >= ALERT_INTERVAL:
                 state["alerts"] += 1
                 state["status"] = "DROWSY"
-                last_alert = now
+                self.last_alert = now
                 queue_audio("You look drowsy. Please take a break.")
         else:
-            if state["calibrating"]:
+            if state.get("calibrating", False):
                 state["status"] = "CALIBRATING"
             elif mouth_avg > YAWN_PHYS_PIXELS:
                 state["status"] = "YAWNING"
             else:
                 state["status"] = "ACTIVE"
 
-        # update state values
+        # update shared state values
         state["eye_avg"] = eye_avg
         state["mouth_avg"] = mouth_avg
 
-        # ---------------- OVERLAY ----------------
-        overlay = frame.copy()
-
+        # overlay status text
+        overlay = img
         cv2.putText(overlay, f"Status: {state['status']}", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
-
         cv2.putText(overlay,
-                    f"Eye(px): {eye_avg:.1f}  Thresh(px): {thresh:.1f}",
+                    f"Eye(px): {eye_avg:.1f}  Thresh(px): {(state.get('eye_thresh') or DEFAULT_EYE_THRESH):.1f}",
                     (10, 55),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (200,200,200), 1)
-
         cv2.putText(overlay,
                     f"Mouth(px): {mouth_avg:.1f}",
                     (10, 80),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (200,200,200), 1)
-
         cv2.putText(overlay,
                     f"Yawns: {state['yawns']}  Alerts: {state['alerts']}",
                     (10, 105),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (200,200,200), 1)
 
-        with frame_lock:
-            latest_overlay = overlay.copy()
+        # return BGR image
+        return overlay
 
-        time.sleep(0.02)
-
-    # cleanup
-    cap.release()
-    state["status"] = "STOPPED"
-    queue_audio("Detection stopped")
-
-
-# ============================================================
-# STREAMLIT UI
-# ============================================================
-
+# -------------------------
+# Streamlit UI
 st.set_page_config(page_title="Eyewake", layout="centered")
-st.title("🕶️ EYEWAKE — Pixel-based Detection (Final Version)")
+st.title("🕶️ EYEWAKE — Pixel-based Detection (webrtc)")
 
 with st.sidebar:
-    st.header("Camera Settings")
-    cam_idx = st.number_input("Camera Index", min_value=0, max_value=5, value=0)
+    st.header("Camera / Settings")
+    # camera index is not used in browser flow, but keep UI for parity
+    cam_idx = st.number_input("Camera Index (ignored for browser camera)", min_value=0, max_value=5, value=0)
 
 col1, col2, col3 = st.columns(3)
 
+webrtc_ctx = None
+
 with col1:
-    if st.button("Start") and not running_event.is_set():
-        stop_event.clear()
-        running_event.set()
-        threading.Thread(target=detection_loop, args=(cam_idx,), daemon=True).start()
-        queue_audio("Detection started")
+    start_btn = st.button("Start")
 
 with col2:
-    if st.button("Calibrate"):
-        if running_event.is_set():
-            calibrate_event.set()
-        else:
-            st.warning("Start detection first.")
+    calibrate_btn = st.button("Calibrate")
 
 with col3:
-    if st.button("Stop"):
-        running_event.clear()
-        stop_event.set()
-        queue_audio("Stopping")
+    stop_btn = st.button("Stop")
 
-img_slot = st.empty()
+# start/stop logic (webrtc_streamer starts when called; we rely on button to show or not show streamer)
+if start_btn:
+    # start the webrtc streamer
+    webrtc_ctx = webrtc_streamer(
+        key="eyewake",
+        video_transformer_factory=MediaPipeTransformer,
+        rtc_configuration={},
+        media_stream_constraints={"video": True, "audio": False},
+        async_transform=True,
+    )
+    state["status"] = "STARTED"
+    queue_audio("Detection started")
+
+if calibrate_btn:
+    if webrtc_ctx and webrtc_ctx.state.playing:
+        state["calibrating"] = True
+    else:
+        st.warning("Start detection first.")
+
+if stop_btn:
+    # there is no direct stop API except stopping the player in the browser; set status
+    state["status"] = "STOPPED"
+    queue_audio("Stopping")
+    # inform user to stop the stream in UI
+    st.info("Click the stop button in the little video player (top-right) to stop the camera.")
+
+# Display state & audio playback loop
 status_slot = st.empty()
 meta_slot = st.empty()
 
-
-# ============================================================
-# MAIN LOOP (UI + AUDIO)
-# ============================================================
-
+# loop to update UI values and play queued audio
 try:
     while True:
-
-        # -------- Audio playback --------
+        # Play queued audio (main thread)
         while not audio_queue.empty():
             msg = audio_queue.get()
             audio_bytes, mime = synthesize_audio_bytes(msg)
@@ -369,45 +330,21 @@ try:
                 st.audio(audio_bytes, format=mime)
             audio_queue.task_done()
 
-        # -------- Video feed --------
-        if not running_event.is_set():
-            img_slot.image(
-                np.zeros((480,640,3), dtype=np.uint8),
-                channels="BGR",
-                use_container_width=True
-            )
-            status_slot.info("Status: Not running")
-            break
-
-        # frame
-        with frame_lock:
-            frame_show = None if latest_overlay is None else latest_overlay.copy()
-
-        if frame_show is not None:
-            img_slot.image(
-                cv2.cvtColor(frame_show, cv2.COLOR_BGR2RGB),
-                use_container_width=True
-            )
-
-        # safe values
-        s = dict(state)
-
+        # Show state
+        s = dict(state)  # snapshot
         status_slot.markdown(
             f"**Status:** {s.get('status','-')} • "
             f"**Yawns:** {s.get('yawns',0)} • "
             f"**Alerts:** {s.get('alerts',0)}"
         )
 
-        # safe numeric formatting
         eye_val = s.get("eye_avg") or 0.0
         mouth_val = s.get("mouth_avg") or 0.0
         baseline = s.get("baseline") or 0.0
         thr = s.get("eye_thresh") or DEFAULT_EYE_THRESH
 
         if s.get("calibrating"):
-            meta_slot.info(
-                f"Calibrating… {s.get('calib_elapsed',0):.1f}/{CALIBRATION_TIME}s"
-            )
+            meta_slot.info(f"Calibrating… {s.get('calib_elapsed',0):.1f}/{CALIBRATION_TIME}s")
         else:
             meta_slot.write(
                 f"Eye(px): {eye_val:.1f} | "
