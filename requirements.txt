@@ -1,17 +1,17 @@
 # core
 streamlit==1.51.0
 
-# media processing
+# mediapipe + opencv
 mediapipe==0.10.14
 opencv-python-headless==4.12.0.88
 numpy==2.2.6
 
-# real-time browser <> server streaming
+# webrtc (choose a released version) — 0.64.0 requires aiortc >=1.11.0
 streamlit-webrtc==0.64.0
-aiortc==1.6.6
+aiortc==1.14.0
 
-# audio/TTS (optional)
+# audio / tts (optional)
 gtts==2.5.4
 pydub==0.25.1
-# pyttsx3 may fail on some cloud hosts; include only if you need server-side offline TTS
+# pyttsx3 optional; remove if cloud host errors on install
 pyttsx3==2.90
