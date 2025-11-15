@@ -1,7 +1,7 @@
-streamlit
-opencv-python-headless
+streamlit==1.51.0
 mediapipe==0.10.14
-numpy
-gtts
-pydub
-protobuf==3.20.*
+opencv-python-headless==4.12.0.88
+numpy==2.2.6
+gtts==2.5.4
+pydub==0.25.1
+# other deps you actually need...
